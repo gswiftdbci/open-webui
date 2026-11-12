@@ -405,6 +405,23 @@ def extract_group_cn_from_dn(group_dn: str) -> str | None:
     return None
 
 
+def _ldap_username_search_filter(
+    username_attributes: list[str],
+    user_input: str,
+    additional_filters: str = '',
+) -> str:
+    """Build an exact-match OR filter across the candidate username attributes.
+
+    Lets users sign in with any supported identifier (e.g. userPrincipalName,
+    sAMAccountName, or mail) instead of a single attribute. The input is
+    lowercased and RFC 4515-escaped once, then matched exactly against each
+    candidate attribute - no substring or ambiguous-name matching.
+    """
+    escaped = escape_filter_chars(user_input.lower())
+    clauses = ''.join(f'({attr}={escaped})' for attr in username_attributes)
+    return f'(&(|{clauses}){additional_filters})'
+
+
 # LDAP Authentication
 @router.post('/ldap', response_model=SigninResult)
 async def ldap_auth(
@@ -480,11 +497,18 @@ async def ldap_auth(
         ENABLE_LDAP_GROUP_CREATION = await Config.get('ldap.group.enable_creation')
         LDAP_ATTRIBUTE_FOR_GROUPS = await Config.get('ldap.server.attribute_for_groups')
 
-        search_attributes = [
-            f'{LDAP_ATTRIBUTE_FOR_USERNAME}',
-            f'{LDAP_ATTRIBUTE_FOR_MAIL}',
-            'cn',
+        # Candidate username attributes: the configured primary attribute,
+        # the AD short account name, and the mail attribute. Exact matches
+        # only; attributes absent from a given server simply never match.
+        # Deduplicated, order preserved.
+        LDAP_USERNAME_ATTRIBUTES = [
+            attr
+            for attr in dict.fromkeys(
+                [LDAP_ATTRIBUTE_FOR_USERNAME, 'sAMAccountName', LDAP_ATTRIBUTE_FOR_MAIL]
+            )
+            if attr
         ]
+        search_attributes = list(dict.fromkeys(LDAP_USERNAME_ATTRIBUTES + ['cn']))
         if ENABLE_LDAP_GROUP_MANAGEMENT:
             search_attributes.append(f'{LDAP_ATTRIBUTE_FOR_GROUPS}')
             log.info('LDAP Group Management enabled. Adding %s to search attributes', LDAP_ATTRIBUTE_FOR_GROUPS)
@@ -493,14 +517,25 @@ async def ldap_auth(
         search_success = await asyncio.to_thread(
             connection_app.search,
             search_base=LDAP_SEARCH_BASE,
-            search_filter=f'(&({LDAP_ATTRIBUTE_FOR_USERNAME}={escape_filter_chars(form_data.user.lower())}){LDAP_SEARCH_FILTERS})',
+            search_filter=_ldap_username_search_filter(
+                LDAP_USERNAME_ATTRIBUTES, form_data.user, LDAP_SEARCH_FILTERS
+            ),
             attributes=search_attributes,
         )
-        if not search_success or not connection_app.entries:
+        # Fail closed: reject both zero matches and ambiguous multi-matches
+        # rather than silently authenticating against the first entry.
+        if not search_success or len(connection_app.entries) != 1:
             raise HTTPException(400, detail='User not found in the LDAP server')
 
         entry = connection_app.entries[0]
-        entry_username = entry[f'{LDAP_ATTRIBUTE_FOR_USERNAME}'].value
+        entry_username = next(
+            (
+                entry[attr].value
+                for attr in LDAP_USERNAME_ATTRIBUTES
+                if attr in entry and entry[attr].value
+            ),
+            None,
+        )
         email = entry[f'{LDAP_ATTRIBUTE_FOR_MAIL}'].value  # retrieve the Attribute value
         if not email and LDAP_DEFAULT_EMAIL_DOMAIN:
             default_email = f'{form_data.user}@{LDAP_DEFAULT_EMAIL_DOMAIN}'
