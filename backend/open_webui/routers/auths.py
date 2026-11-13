@@ -542,11 +542,15 @@ async def ldap_auth(
             if validate_email_format(default_email):
                 email = default_email
 
-        username_list = []  # list of usernames from LDAP attribute
-        if isinstance(entry_username, list):
-            username_list = [str(name).lower() for name in entry_username]
-        else:
-            username_list = [str(entry_username).lower()]
+        username_list = []  # all accepted login forms (UPN / sAMAccountName / mail)
+        for attr in LDAP_USERNAME_ATTRIBUTES:
+            if attr in entry and entry[attr].value:
+                val = entry[attr].value
+                if isinstance(val, list):
+                    username_list += [str(n).lower() for n in val if n]
+                else:
+                    username_list.append(str(val).lower())
+        username_list = list(dict.fromkeys(username_list))
 
         # TODO: support multiple emails if LDAP returns a list
         if not email:
